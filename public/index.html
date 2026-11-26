@@ -8,19 +8,24 @@
 <style>
   :root {
     --bg: #14110f; --panel: #1e1a17; --ink: #eadfcf; --muted: #a8977f;
-    --accent: #e0a14a; --line: #3a322b; --dm: #241f1b; --you: #2c2418;
+    --accent: #e0a14a; --line: #3a322b; --dm: #241f1b; --you: #2c2418; --other: #1f2622;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink); font: 18px/1.55 "Crimson Pro", Georgia, serif; }
   header { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; gap: 12px; }
   h1 { font: 600 22px "Cinzel", serif; margin: 0; color: var(--accent); letter-spacing: 1px; }
+  .hdr-btns { display: flex; gap: 8px; }
   .wrap { display: grid; grid-template-columns: 1fr 300px; height: calc(100vh - 58px); }
   main { display: flex; flex-direction: column; min-height: 0; }
   #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
   .msg { padding: 10px 14px; border-radius: 8px; max-width: 85%; white-space: pre-wrap; }
+  .who { display: block; font-size: 13px; color: var(--muted); margin-bottom: 2px; }
   .dm { background: var(--dm); border-left: 3px solid var(--accent); }
   .you { background: var(--you); align-self: flex-end; color: #f3e6d0; }
+  .other { background: var(--other); align-self: flex-end; }
   .changes { font-size: 14px; color: var(--muted); margin-top: 6px; }
+  .note { align-self: center; color: var(--muted); font-style: italic; font-size: 15px; text-align: center; max-width: 90%; }
+  #thinking { padding: 0 16px; min-height: 24px; color: var(--muted); font-style: italic; font-size: 15px; }
   form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
   input { flex: 1; min-width: 0; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; font: inherit; }
   button { background: var(--accent); color: #1a1208; border: 0; border-radius: 6px; padding: 10px 16px; font: 600 16px "Crimson Pro", serif; cursor: pointer; }
@@ -35,12 +40,14 @@
   .hostile { background: #6b1f1f; } .wary { background: #6b4b1f; } .neutral { background: #3d3a35; }
   .friendly { background: #275a2e; } .loyal { background: #1f4f6b; }
   .mem { color: var(--muted); font-size: 14px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #555; margin-right: 6px; }
+  .dot.on { background: #5fbf6a; }
   .chapter { margin-bottom: 10px; } .chapter b { color: var(--accent); font-size: 15px; }
   .bar { height: 6px; background: var(--line); border-radius: 3px; margin: 6px 0; overflow: hidden; }
   .bar span { display: block; height: 100%; background: var(--accent); }
-  .note { align-self: center; color: var(--muted); font-style: italic; font-size: 15px; }
   #intro { max-width: 460px; margin: 12vh auto; text-align: center; padding: 0 16px; }
   #intro p { color: var(--muted); }
+  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--accent); color: #1a1208; padding: 8px 14px; border-radius: 6px; display: none; }
   @media (max-width: 760px) {
     .wrap { grid-template-columns: 1fr; height: auto; }
     main { height: 70vh; }
@@ -51,14 +58,18 @@
 <body>
 <header>
   <h1>⚒ MythForge</h1>
-  <button class="ghost" id="reset" hidden>New world</button>
+  <div class="hdr-btns">
+    <button class="ghost" id="invite" title="Copy a link friends can use to join this world">Invite</button>
+    <button class="ghost" id="reset" hidden>New world</button>
+  </div>
 </header>
 
 <section id="intro">
   <p>Emberfall's bell has fallen silent, and every night someone vanishes into the woods.</p>
-  <p>A village that never forgets — every promise, insult and debt is remembered, forever.</p>
+  <p>A village that never forgets: every promise, insult and debt is remembered, forever.</p>
+  <p id="joinInfo"></p>
   <form id="startForm" style="border:0;padding:0">
-    <input id="name" placeholder="Your hero's name" maxlength="30" autocomplete="off" />
+    <input id="name" placeholder="Your hero's name" maxlength="24" autocomplete="off" />
     <button>Begin</button>
   </form>
 </section>
@@ -66,6 +77,7 @@
 <div class="wrap" id="game" hidden>
   <main>
     <div id="log"></div>
+    <div id="thinking"></div>
     <form id="turnForm">
       <input id="msg" placeholder="What do you do?" maxlength="500" autocomplete="off" />
       <button id="send">Act</button>
@@ -74,114 +86,141 @@
   </main>
   <aside>
     <h2>Quest</h2><div id="quest"></div>
-    <h2>Hero</h2><ul id="hero"></ul>
+    <h2>You</h2><ul id="hero"></ul>
     <h2>Inventory</h2><ul id="inv"></ul>
+    <h2>Heroes in this world</h2><ul id="heroes"></ul>
     <h2>People of Emberfall</h2><ul id="npcs"></ul>
     <h2>Legend</h2><ul id="chapters"></ul>
     <h2>Recent deeds</h2><ul id="events"></ul>
   </aside>
 </div>
+<div id="toast"></div>
 
 <script>
-  // One world per browser (single player). Multiplayer later = share this id.
-  let worldId;
-  try { worldId = localStorage.getItem("mythforge-world"); } catch {}
-  if (!worldId) {
-    worldId = crypto.randomUUID();
-    try { localStorage.setItem("mythforge-world", worldId); } catch {}
-  }
+  // ---- Identity: which world (shareable via ?w=) and which hero (this browser) ----
+  const store = {
+    get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+    set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+  };
+  const params = new URLSearchParams(location.search);
+  let worldId = params.get("w") || store.get("mythforge-world") || crypto.randomUUID();
+  store.set("mythforge-world", worldId);
+  if (params.get("w") !== worldId) history.replaceState(null, "", `?w=${worldId}`);
+  let heroId = store.get("mythforge-hero") || crypto.randomUUID();
+  store.set("mythforge-hero", heroId);
+
   const API = `/agents/myth-agent/${worldId}`;
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  let me = null;      // my hero name, once joined
+  let live = false;   // is the WebSocket connected?
 
   async function call(body) {
-    const res = await fetch(API, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {});
+    const res = await fetch(API, body
+      ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hero: heroId, ...body }) }
+      : {});
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || res.statusText);
     return data;
   }
 
-  function addMsg(role, text, changes = [], roll) {
+  // ---- Rendering ----
+  function addEntry(e) {
     const div = document.createElement("div");
-    div.className = "msg " + (role === "user" ? "you" : "dm");
-    div.textContent = text;
-    if (changes.length || roll) {
-      const c = document.createElement("div");
-      c.className = "changes";
-      c.textContent = [roll ? `🎲 d20: ${roll}` : null, ...changes].filter(Boolean).join("  ·  ");
-      div.appendChild(c);
+    if (e.role === "system") {
+      div.className = "note";
+      div.textContent = e.content;
+    } else if (e.role === "user") {
+      div.className = "msg " + (e.hero === me ? "you" : "other");
+      div.innerHTML = `<span class="who">${esc(e.hero === me ? "You" : e.hero)}</span>`;
+      div.append(e.content);
+    } else {
+      div.className = "msg dm";
+      if (e.hero && e.hero !== me) div.innerHTML = `<span class="who">DM → ${esc(e.hero)}</span>`;
+      div.append(e.content);
+      if ((e.changes && e.changes.length) || e.roll) {
+        const c = document.createElement("div");
+        c.className = "changes";
+        c.textContent = [e.roll ? `🎲 d20: ${e.roll}` : null, ...(e.changes || [])].filter(Boolean).join("  ·  ");
+        div.appendChild(c);
+      }
     }
     $("log").appendChild(div);
     $("log").scrollTop = $("log").scrollHeight;
   }
 
+  function note(text) { addEntry({ role: "system", content: text }); }
+
+  function toast(text) {
+    $("toast").textContent = text;
+    $("toast").style.display = "block";
+    setTimeout(() => ($("toast").style.display = "none"), 2200);
+  }
+
   function render(state) {
-    $("intro").hidden = state.started;
-    $("game").hidden = !state.started;
-    $("reset").hidden = !state.started;
-    if (!state.started) return;
+    const mine = (state.heroes || []).find((h) => h.id === heroId);
+    me = mine ? mine.name : null;
+    $("intro").hidden = !!mine;
+    $("game").hidden = !mine;
+    $("reset").hidden = !mine;
+    const others = (state.heroes || []).filter((h) => h.id !== heroId);
+    $("joinInfo").textContent = others.length
+      ? `${others.map((h) => h.name).join(", ")} ${others.length > 1 ? "are" : "is"} already in this world.`
+      : "";
+    if (!mine) return;
+
     const q = state.quest;
-    if (q) {
-      const pct = Math.round((q.stage / q.total) * 100);
-      $("quest").innerHTML = `<b>${esc(q.title)}</b>
-        <div class="bar"><span style="width:${pct}%"></span></div>
-        <div class="mem">${q.complete ? "" : `Step ${q.stage + 1} of ${q.total}: `}${esc(q.objective)}</div>`;
-    }
-    const p = state.player;
-    $("hero").innerHTML = `<li><b>${esc(p.name)}</b></li><li>❤️ ${p.hp}/${p.maxHp} HP</li><li>🪙 ${p.gold} gold</li><li>📍 ${esc(p.location)}</li>`;
-    $("inv").innerHTML = state.inventory.map((i) => `<li>${esc(i.item)} ×${i.qty}</li>`).join("") || "<li class=mem>empty</li>";
+    const pct = Math.round((q.stage / q.total) * 100);
+    $("quest").innerHTML = `<b>${esc(q.title)}</b><div class="bar"><span style="width:${pct}%"></span></div>
+      <div class="mem">${q.complete ? "" : `Step ${q.stage + 1} of ${q.total}: `}${esc(q.objective)}</div>`;
+    $("hero").innerHTML = `<li><b>${esc(mine.name)}</b></li><li>❤️ ${mine.hp}/${mine.maxHp} HP</li><li>🪙 ${mine.gold} gold</li><li>📍 ${esc(mine.location)}</li>`;
+    $("inv").innerHTML = mine.inventory.map((i) => `<li>${esc(i.item)} ×${i.qty}</li>`).join("") || "<li class=mem>empty</li>";
+    $("heroes").innerHTML = state.heroes.map((h) =>
+      `<li><span class="dot ${h.online ? "on" : ""}"></span><b>${esc(h.name)}</b>${h.id === heroId ? " (you)" : ""}
+       <div class="mem">${esc(h.location)} · ❤️ ${h.hp}/${h.maxHp}</div></li>`).join("");
     $("npcs").innerHTML = state.npcs.map((n) =>
       `<li><b>${esc(n.name)}</b><span class="att ${esc(n.attitude)}">${esc(n.attitude)}</span><div class="mem">${esc(n.location)} — ${esc(n.memory)}</div></li>`).join("");
-    $("chapters").innerHTML = (state.chapters || []).map((c) =>
+    $("chapters").innerHTML = state.chapters.map((c) =>
       `<li class="chapter"><b>${esc(c.title)}</b><div class="mem">${esc(c.summary)}</div></li>`).join("")
       || "<li class=mem>No chapters yet. Rest to have the chronicler write one.</li>";
     $("events").innerHTML = state.recentEvents.map((e) => `<li class=mem>• ${esc(e)}</li>`).join("");
   }
 
-  function note(text) {
-    const div = document.createElement("div");
-    div.className = "note";
-    div.textContent = text;
-    $("log").appendChild(div);
-    $("log").scrollTop = $("log").scrollHeight;
-  }
-
-  // The Chronicle Workflow runs in the background; poll until the new chapter lands.
-  function awaitChapter(prevCount) {
-    note("📜 The chronicler dips a quill in ink…");
-    let tries = 0;
-    const timer = setInterval(async () => {
-      try {
-        const { state } = await call();
-        if ((state.chapters || []).length > prevCount) {
-          clearInterval(timer);
-          render(state);
-          const c = state.chapters[state.chapters.length - 1];
-          note(`📖 ${c.title} — ${c.summary}`);
-        } else if (++tries > 20) clearInterval(timer);
-      } catch { clearInterval(timer); }
-    }, 3000);
-  }
-
   function busy(on) {
-    document.querySelectorAll("button, input").forEach((el) => (el.disabled = on));
+    document.querySelectorAll("form button, form input").forEach((el) => (el.disabled = on));
   }
 
-  async function load() {
+  async function loadAll() {
     const { state, log } = await call();
-    $("log").innerHTML = "";
-    log.forEach((m) => addMsg(m.role, m.content));
     render(state);
-    if (state.awayNews) note(`🌙 While you were away… ${state.awayNews}`);
+    $("log").innerHTML = "";
+    log.forEach(addEntry);
   }
 
+  // ---- Live updates over WebSocket (Agents SDK) ----
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}${API}?hero=${heroId}`);
+    ws.onopen = () => { live = true; loadAll().catch(console.error); };
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "cf_agent_state" && msg.state) render(msg.state);  // world state sync
+      else if (msg.type === "mf_log") addEntry(msg.entry);              // a new story line
+      else if (msg.type === "mf_thinking")
+        $("thinking").textContent = msg.hero ? `🕯 The DM is weaving ${msg.hero === me ? "your" : msg.hero + "'s"} fate…` : "";
+      else if (msg.type === "mf_reset") { $("log").innerHTML = ""; note("The world was unmade. A new tale begins."); }
+    };
+    ws.onclose = () => { live = false; setTimeout(connect, 2000); }; // auto-reconnect
+  }
+
+  // ---- Actions ----
   $("startForm").onsubmit = async (e) => {
     e.preventDefault();
     busy(true);
     try {
-      const r = await call({ action: "start", name: $("name").value });
-      render(r.state);
-      addMsg("assistant", r.narration, r.changes);
+      const r = await call({ action: "join", name: $("name").value });
+      if (!live) await loadAll(); else render(r.state);
     } catch (err) { alert(err.message); }
     busy(false);
     $("msg").focus();
@@ -191,15 +230,12 @@
     e.preventDefault();
     const text = $("msg").value.trim();
     if (!text) return;
-    addMsg("user", text);
     $("msg").value = "";
     busy(true);
     try {
-      const r = await call({ action: "turn", message: text });
-      addMsg("assistant", r.narration, r.changes, r.roll);
-      render(r.state);
-      if (r.chronicling) awaitChapter(r.state.chapters.length);
-    } catch (err) { addMsg("assistant", "⚠️ " + err.message); }
+      await call({ action: "turn", message: text });
+      if (!live) await loadAll(); // the WebSocket normally delivers the story lines
+    } catch (err) { note("⚠️ " + err.message); }
     busy(false);
     $("msg").focus();
   };
@@ -208,20 +244,26 @@
     busy(true);
     try {
       const r = await call({ action: "rest" });
-      if (r.chronicling) awaitChapter(r.state.chapters.length);
-      else note("Nothing worth chronicling yet — go make some trouble.");
+      note(r.chronicling ? "📜 The chronicler dips a quill in ink…" : "Nothing worth chronicling yet. Go make some trouble.");
+      if (r.chronicling && !live) setTimeout(() => loadAll().catch(() => {}), 15000);
     } catch (err) { note("⚠️ " + err.message); }
     busy(false);
   };
 
-  $("reset").onclick = async () => {
-    if (!confirm("Destroy this world and start over?")) return;
-    const r = await call({ action: "reset" });
-    $("log").innerHTML = "";
-    render(r.state);
+  $("invite").onclick = async () => {
+    const link = `${location.origin}${location.pathname}?w=${worldId}`;
+    try { await navigator.clipboard.writeText(link); toast("Invite link copied!"); }
+    catch { prompt("Share this link with friends:", link); }
   };
 
-  load().catch((err) => console.error(err));
+  $("reset").onclick = async () => {
+    if (!confirm("Destroy this world for EVERY hero in it and start over?")) return;
+    await call({ action: "reset" });
+    await loadAll();
+  };
+
+  loadAll().catch(console.error);
+  connect();
 </script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-import { Agent, getAgentByName, routeAgentRequest } from "agents";
+import { Agent, getAgentByName, routeAgentRequest, type Connection, type ConnectionContext } from "agents";
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 
 /**
@@ -79,11 +79,20 @@ const STARTING_NPCS = [
   { name: "Old Tessa", location: "Night Market", attitude: "wary", memory: "Fortune-teller who sells strange charms." },
 ];
 
+type Hero = {
+  id: string;
+  name: string;
+  hp: number;
+  maxHp: number;
+  gold: number;
+  location: string;
+  inventory: { item: string; qty: number }[];
+  online: boolean;
+};
+
 export type WorldState = {
   started: boolean;
-  turn: number;
-  player: { name: string; hp: number; maxHp: number; gold: number; location: string } | null;
-  inventory: { item: string; qty: number }[];
+  heroes: Hero[];
   npcs: { name: string; location: string; attitude: Attitude; memory: string }[];
   recentEvents: string[];
   awayNews: string | null;
@@ -91,15 +100,22 @@ export type WorldState = {
   quest: { title: string; stage: number; total: number; objective: string; complete: boolean };
 };
 
+type LogEntry = { role: "user" | "assistant" | "system"; hero: string | null; content: string; changes?: string[]; roll?: number };
+
 type Action =
   | { type: "move"; location: string }
   | { type: "add_item"; item: string; qty?: number }
   | { type: "remove_item"; item: string; qty?: number }
+  | { type: "give_item"; item: string; qty?: number; to: string }
   | { type: "change_gold"; amount: number }
   | { type: "change_hp"; amount: number }
   | { type: "npc_update"; npc: string; attitude?: string; memory?: string; location?: string }
   | { type: "log_event"; text: string }
   | { type: "advance_quest"; text?: string };
+
+const ACTION_TYPES: Action["type"][] = [
+  "move", "add_item", "remove_item", "give_item", "change_gold", "change_hp", "npc_update", "log_event", "advance_quest",
+];
 
 const RESPONSE_SCHEMA = {
   type: "object",
@@ -110,13 +126,11 @@ const RESPONSE_SCHEMA = {
       items: {
         type: "object",
         properties: {
-          type: {
-            type: "string",
-            enum: ["move", "add_item", "remove_item", "change_gold", "change_hp", "npc_update", "log_event", "advance_quest"],
-          },
+          type: { type: "string", enum: ACTION_TYPES },
           location: { type: "string" },
           item: { type: "string" },
           qty: { type: "number" },
+          to: { type: "string" },
           amount: { type: "number" },
           npc: { type: "string" },
           attitude: { type: "string", enum: [...ATTITUDES] },
@@ -130,12 +144,19 @@ const RESPONSE_SCHEMA = {
   required: ["narration", "actions"],
 };
 
+type HeroRow = { id: string; name: string; hp: number; max_hp: number; gold: number; location: string };
+type NpcRow = { name: string; location: string; attitude: string; memory: string };
+
+/**
+ * One MythAgent (a Durable Object) = one shared world. Any number of heroes can
+ * join it via a link. NPCs, quest, chronicle and events are shared; each hero
+ * has their own stats and inventory. Clients get live updates over WebSockets:
+ * world state via Agent state sync, story lines via broadcast.
+ */
 export class MythAgent extends Agent<Env, WorldState> {
   initialState: WorldState = {
     started: false,
-    turn: 0,
-    player: null,
-    inventory: [],
+    heroes: [],
     npcs: [],
     recentEvents: [],
     awayNews: null,
@@ -143,11 +164,17 @@ export class MythAgent extends Agent<Env, WorldState> {
     quest: { title: MAIN_QUEST.title, stage: 0, total: MAIN_QUEST.stages.length, objective: "", complete: false },
   };
 
+  /** Turns run one at a time so two heroes can't race on the same world facts. */
+  private turnQueue: Promise<unknown> = Promise.resolve();
+
   async onStart() {
-    this.sql`CREATE TABLE IF NOT EXISTS player (
-      id INTEGER PRIMARY KEY CHECK (id = 1), name TEXT, hp INTEGER, max_hp INTEGER,
-      gold INTEGER, location TEXT, turn INTEGER)`;
-    this.sql`CREATE TABLE IF NOT EXISTS inventory (item TEXT PRIMARY KEY, qty INTEGER)`;
+    // Single-player tables from Step 1/2 are replaced by per-hero tables.
+    for (const t of ["player", "inventory", "messages"]) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${t}`);
+    this.sql`CREATE TABLE IF NOT EXISTS heroes (
+      id TEXT PRIMARY KEY, name TEXT UNIQUE, hp INTEGER, max_hp INTEGER, gold INTEGER,
+      location TEXT, last_seen INTEGER)`;
+    this.sql`CREATE TABLE IF NOT EXISTS items (
+      hero_id TEXT, item TEXT, qty INTEGER, PRIMARY KEY (hero_id, item))`;
     this.sql`CREATE TABLE IF NOT EXISTS npcs (
       name TEXT PRIMARY KEY, location TEXT, attitude TEXT, memory TEXT)`;
     this.sql`CREATE TABLE IF NOT EXISTS events (
@@ -155,26 +182,52 @@ export class MythAgent extends Agent<Env, WorldState> {
     this.sql`CREATE TABLE IF NOT EXISTS chapters (
       id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, summary TEXT, last_event_id INTEGER)`;
     this.sql`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`;
-    this.sql`CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT)`;
+    this.sql`CREATE TABLE IF NOT EXISTS log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, hero TEXT, content TEXT)`;
   }
 
-  // ---------- HTTP API (single player; WebSockets come with multiplayer) ----------
+  // ---------- Live connections (presence) ----------
+  onConnect(connection: Connection, ctx: ConnectionContext) {
+    const hero = new URL(ctx.request.url).searchParams.get("hero");
+    connection.setState({ hero: validId(hero) ? hero : null });
+    this.snapshot(); // pushes state (with updated "online" flags) to everyone
+  }
+
+  async onClose() {
+    this.snapshot();
+    // When the last hero leaves, start the "while you were away" clock.
+    if (this.onlineHeroIds().size === 0 && this.allHeroes().length > 0) await this.scheduleWorldTick();
+  }
+
+  onlineHeroIds() {
+    const ids = new Set<string>();
+    for (const c of this.getConnections<{ hero: string | null }>()) if (c.state?.hero) ids.add(c.state.hero);
+    return ids;
+  }
+
+  // ---------- HTTP API ----------
   async onRequest(request: Request): Promise<Response> {
     if (request.method === "GET") return Response.json(this.snapshot());
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
 
-    const body = (await request.json().catch(() => ({}))) as { action?: string; name?: string; message?: string };
+    const body = (await request.json().catch(() => ({}))) as {
+      action?: string; hero?: string; name?: string; message?: string;
+    };
     try {
-      if (body.action === "start") return Response.json(await this.startGame(body.name ?? ""));
-      if (body.action === "turn") return Response.json(await this.playTurn(body.message ?? ""));
-      if (body.action === "rest") {
-        const started = await this.startChronicle(true);
-        return Response.json({ chronicling: started, ...this.snapshot() });
-      }
-      if (body.action === "reset") {
-        this.resetWorld();
-        return Response.json(this.snapshot());
+      const heroId = validId(body.hero) ? body.hero! : null;
+      if (!heroId) return Response.json({ error: "Missing hero id" }, { status: 400 });
+      switch (body.action) {
+        case "join":
+          return Response.json(await this.exclusive(() => this.joinWorld(heroId, body.name ?? "")));
+        case "turn":
+          return Response.json(await this.exclusive(() => this.playTurn(heroId, body.message ?? "")));
+        case "rest": {
+          const started = await this.startChronicle(true);
+          return Response.json({ chronicling: started, ...this.snapshot() });
+        }
+        case "reset":
+          this.resetWorld();
+          return Response.json(this.snapshot());
       }
       return Response.json({ error: "Unknown action" }, { status: 400 });
     } catch (err) {
@@ -183,64 +236,90 @@ export class MythAgent extends Agent<Env, WorldState> {
     }
   }
 
-  // ---------- Game logic ----------
-  async startGame(rawName: string) {
-    if (this.getPlayer()) return this.snapshot();
-    const name = rawName.trim().slice(0, 30) || "Wanderer";
-    this.sql`INSERT INTO player (id, name, hp, max_hp, gold, location, turn)
-             VALUES (1, ${name}, 20, 20, 10, 'Emberfall Square', 0)`;
-    this.sql`INSERT INTO inventory (item, qty) VALUES ('rusty dagger', 1), ('travel bread', 2)`;
-    for (const n of STARTING_NPCS) {
-      this.sql`INSERT INTO npcs (name, location, attitude, memory)
-               VALUES (${n.name}, ${n.location}, ${n.attitude}, ${n.memory})`;
-    }
-    this.logEvent(`${name} arrived in Emberfall.`);
-    return this.playTurn(
-      "(I arrive in Emberfall for the first time. Set the scene in 3-4 sentences: the silent bell, the vanishings, and Mira's missing brother Tomas, so I know my goal. End by pointing me toward my first lead.)",
-      true,
-    );
+  exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.turnQueue.then(fn, fn);
+    this.turnQueue = run.catch(() => {});
+    return run;
   }
 
-  async playTurn(message: string, isIntro = false) {
-    const player = this.getPlayer();
-    if (!player) throw new Error("Game not started");
-    if (player.hp <= 0) {
-      return { narration: "Your story has ended. Reset the world to begin anew.", changes: [], ...this.snapshot() };
+  // ---------- Game logic ----------
+  initWorld() {
+    const [done] = this.sql<{ value: string }>`SELECT value FROM meta WHERE key = 'world_init'`;
+    if (done) return false;
+    for (const n of STARTING_NPCS) {
+      this.sql`INSERT OR REPLACE INTO npcs (name, location, attitude, memory)
+               VALUES (${n.name}, ${n.location}, ${n.attitude}, ${n.memory})`;
+    }
+    this.sql`INSERT OR REPLACE INTO meta (key, value) VALUES ('world_init', '1')`;
+    return true;
+  }
+
+  async joinWorld(heroId: string, rawName: string) {
+    if (this.getHero(heroId)) return this.snapshot();
+    const fresh = this.initWorld();
+
+    let name = rawName.trim().replace(/\s+/g, " ").slice(0, 24) || "Wanderer";
+    const taken = (n: string) => this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM heroes WHERE lower(name) = lower(${n})`[0].n > 0;
+    for (let i = 2; taken(name); i++) name = `${name.replace(/ \d+$/, "")} ${i}`;
+
+    this.sql`INSERT INTO heroes (id, name, hp, max_hp, gold, location, last_seen)
+             VALUES (${heroId}, ${name}, 20, 20, 10, 'Emberfall Square', ${Date.now()})`;
+    this.sql`INSERT INTO items (hero_id, item, qty) VALUES (${heroId}, 'rusty dagger', 1), (${heroId}, 'travel bread', 2)`;
+    this.logEvent(`${name} arrived in Emberfall.`);
+
+    const intro = fresh
+      ? "(I arrive in Emberfall for the first time. Set the scene in 3-4 sentences: the silent bell, the vanishings, and Mira's missing brother Tomas, so I know my goal. End by pointing me toward my first lead.)"
+      : "(I arrive in Emberfall, joining the heroes already here. In 2-3 sentences, welcome me: mention the silent bell, the current objective, and who is already in the village and what they are known for.)";
+    return this.playTurn(heroId, intro, true);
+  }
+
+  async playTurn(heroId: string, message: string, isIntro = false) {
+    const hero = this.getHero(heroId);
+    if (!hero) throw new Error("Join the world first");
+    this.sql`UPDATE heroes SET last_seen = ${Date.now()} WHERE id = ${heroId}`;
+    if (hero.hp <= 0) {
+      return { narration: "You have fallen. Your tale is told by others now.", changes: [], ...this.snapshot() };
     }
     const text = message.trim().slice(0, 500);
     if (!text) throw new Error("Empty message");
 
-    const roll = 1 + Math.floor(Math.random() * 20);
-    const history = this.sql<{ role: string; content: string }>`
-      SELECT role, content FROM (SELECT * FROM messages ORDER BY id DESC LIMIT 8) ORDER BY id ASC`;
+    if (!isIntro) this.pushLog({ role: "user", hero: hero.name, content: text });
+    this.broadcast(JSON.stringify({ type: "mf_thinking", hero: hero.name }));
 
-    // News from a world tick that happened while the player was away (shown once).
+    const roll = 1 + Math.floor(Math.random() * 20);
+    const history = this.sql<{ role: string; hero: string | null; content: string }>`
+      SELECT role, hero, content FROM (SELECT * FROM log WHERE role != 'system' ORDER BY id DESC LIMIT 10) ORDER BY id ASC`;
+    if (!isIntro) history.pop(); // the current message is appended below
+
+    // News from a world tick that happened while everyone was away (shown once).
     const [away] = this.sql<{ value: string }>`SELECT value FROM meta WHERE key = 'away_news'`;
     const awayNote = away
-      ? `\n\nWHILE THE PLAYER WAS AWAY: ${away.value}\nThe world has changed accordingly; let it show naturally this turn (a look, a rumor, a cold welcome).`
+      ? `\n\nWHILE THE HEROES WERE AWAY: ${away.value}\nThe world has changed accordingly; let it show naturally this turn (a look, a rumor, a cold welcome).`
       : "";
 
     const messages = [
-      { role: "system", content: this.systemPrompt(roll) + awayNote },
-      ...history.map((m) => ({ role: m.role, content: m.content })),
-      { role: "user", content: text },
+      { role: "system", content: this.systemPrompt(hero, roll) + awayNote },
+      ...history.map((m) => ({ role: m.role, content: m.role === "user" ? `${m.hero}: ${m.content}` : m.content })),
+      { role: "user", content: `${hero.name}: ${text}` },
     ];
 
-    const result = (await this.env.AI.run(this.env.MODEL as keyof AiModels, {
-      messages,
-      max_tokens: 700,
-      temperature: 0.8,
-      response_format: { type: "json_schema", json_schema: RESPONSE_SCHEMA },
-    } as any)) as { response?: unknown };
+    let parsed: { narration: string; actions: Action[] };
+    try {
+      const result = (await this.env.AI.run(this.env.MODEL as keyof AiModels, {
+        messages,
+        max_tokens: 700,
+        temperature: 0.8,
+        response_format: { type: "json_schema", json_schema: RESPONSE_SCHEMA },
+      } as any)) as { response?: unknown };
+      parsed = parseModelOutput(result?.response);
+    } finally {
+      this.broadcast(JSON.stringify({ type: "mf_thinking", hero: null }));
+    }
 
-    const parsed = parseModelOutput(result?.response);
-    const changes = this.applyActions(parsed.actions, `${text} ${parsed.narration}`);
+    const changes = this.applyActions(parsed.actions, `${text} ${parsed.narration}`, heroId);
     if (away) this.sql`DELETE FROM meta WHERE key = 'away_news'`;
 
-    this.sql`UPDATE player SET turn = turn + 1 WHERE id = 1`;
-    if (!isIntro) this.sql`INSERT INTO messages (role, content) VALUES ('user', ${text})`;
-    this.sql`INSERT INTO messages (role, content) VALUES ('assistant', ${parsed.narration})`;
-    this.sql`DELETE FROM messages WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT 40)`;
+    this.pushLog({ role: "assistant", hero: hero.name, content: parsed.narration, changes, roll: isIntro ? undefined : roll });
 
     const chronicling = await this.startChronicle(false);
     await this.scheduleWorldTick();
@@ -248,22 +327,22 @@ export class MythAgent extends Agent<Env, WorldState> {
     return { narration: parsed.narration, roll, changes, chronicling, ...snap };
   }
 
-  systemPrompt(roll: number) {
-    const p = this.getPlayer()!;
-    const inv = this.sql<{ item: string; qty: number }>`SELECT item, qty FROM inventory`;
-    const npcs = this.sql<{ name: string; location: string; attitude: string; memory: string }>`SELECT * FROM npcs`;
+  systemPrompt(hero: HeroRow, roll: number) {
+    const heroes = this.allHeroes();
+    const npcs = this.sql<NpcRow>`SELECT * FROM npcs`;
     const chapters = this.sql<{ title: string; summary: string }>`
       SELECT title, summary FROM chapters ORDER BY id DESC LIMIT 5`.reverse();
     const events = this.sql<{ text: string }>`
       SELECT text FROM events WHERE id > ${this.lastChronicledId()} ORDER BY id DESC LIMIT 15`.reverse();
 
-    return `You are the Dungeon Master of MythForge, a dark-fantasy text adventure set in the village of Emberfall.
-Narrate in second person. Be punchy: 2-3 sentences, about 25-50 words. Include one vivid detail and, when it fits, a line of NPC dialogue. Show only what changed or what the player notices; no scenery recaps, no summaries of what just happened. Stay in character. Never decide the player's actions for them.
+    return `You are the Dungeon Master of MythForge, a dark-fantasy text adventure set in the village of Emberfall. Several heroes may share this world.
+Narrate to the ACTING HERO in second person ("you"); refer to other heroes by name. Be punchy: 2-3 sentences, about 25-50 words. Include one vivid detail and, when it fits, a line of NPC dialogue. Show only what changed or what the hero notices; no scenery recaps. Stay in character. Never decide any hero's actions for them.
 
-THE WORLD FACTS BELOW ARE THE TRUTH. Never contradict them. NPCs remember everything in their "memory" and act according to their attitude.
+THE WORLD FACTS BELOW ARE THE TRUTH. Never contradict them. NPCs remember everything in their "memory", act according to their attitude, and gossip: what one hero did can change how NPCs treat the others.
 
-PLAYER: ${p.name} | HP ${p.hp}/${p.max_hp} | Gold ${p.gold} | Location: ${p.location}
-INVENTORY: ${inv.map((i) => `${i.item} x${i.qty}`).join(", ") || "empty"}
+ACTING HERO: ${hero.name} | HP ${hero.hp}/${hero.max_hp} | Gold ${hero.gold} | Location: ${hero.location}
+ALL HEROES:
+${heroes.map((h) => `- ${h.name} @ ${h.location} | HP ${h.hp}/${h.maxHp} | Gold ${h.gold} | Items: ${h.inventory.map((i) => `${i.item} x${i.qty}`).join(", ") || "none"}`).join("\n")}
 LOCATIONS: ${Object.entries(LOCATIONS).map(([k, v]) => `${k} — ${v}`).join(" | ")}
 NPCS:
 ${npcs.map((n) => `- ${n.name} @ ${n.location} [${n.attitude}]: ${n.memory}`).join("\n")}
@@ -272,41 +351,45 @@ ${chapters.map((c) => `- ${c.title}: ${c.summary}`).join("\n") || "- (this story
 RECENT EVENTS (oldest first):
 ${events.map((e) => `- ${e.text}`).join("\n") || "- none"}
 
-MAIN QUEST — "${MAIN_QUEST.title}": ${MAIN_QUEST.premise}
+MAIN QUEST — "${MAIN_QUEST.title}" (shared by all heroes): ${MAIN_QUEST.premise}
 ${this.questPromptSection()}
 
-FATE DIE this turn: d20 = ${roll}. Only if the player attempts something risky, use it: 1-5 fails badly, 6-10 fails, 11-15 succeeds with a cost, 16-20 succeeds well. Mention the roll when you use it.
+FATE DIE this turn: d20 = ${roll}. Only if the acting hero attempts something risky, use it: 1-5 fails badly, 6-10 fails, 11-15 succeeds with a cost, 16-20 succeeds well. Mention the roll when you use it.
 
-RULES FOR CHANGING THE WORLD: if anything in the story changes the world, you MUST record it as an action, or it did not happen.
-- "move": whenever the player goes to a different place, put a move action FIRST, with one of the LOCATIONS (exact name).
-- "add_item"/"remove_item": item (lowercase, EXACT inventory name when removing) + qty. Player can only use or give items they own. In trades, take ONLY what the player explicitly offers; never add extra items or gold to the deal.
+RULES FOR CHANGING THE WORLD: if anything in the story changes the world, you MUST record it as an action, or it did not happen. All actions apply to the ACTING HERO.
+- "move": whenever the acting hero goes to a different place, put a move action FIRST, with one of the LOCATIONS (exact name).
+- "add_item"/"remove_item": item (lowercase, EXACT inventory name when removing) + qty. Heroes can only use or give items they own. In trades, take ONLY what the hero explicitly offers; never add extra items or gold to the deal.
+- "give_item": the acting hero hands an item they own to ANOTHER HERO: item, qty, to (that hero's exact name).
 - "change_gold"/"change_hp": amount (+/-). Gold can't go below 0.
-- "npc_update": npc name, and any of attitude (${ATTITUDES.join("/")}), memory (ONE short NEW fact the NPC will remember, e.g. "Kael spat on his anvil."), location. Use this to introduce NEW npcs too.
-- "advance_quest": ONLY when the player has clearly and fully done the CURRENT OBJECTIVE this turn (not just talked about it). Add "text": one sentence on how they did it. Never advance on intent alone.
-- "log_event": one short past-tense sentence for anything important (promises, insults, thefts, fights, debts, discoveries). Almost every turn has one.
+- "npc_update": npc name, and any of attitude (${ATTITUDES.join("/")}), memory (ONE short NEW fact naming the hero, e.g. "${hero.name} spat on his anvil."), location. Use this to introduce NEW npcs too.
+- "advance_quest": ONLY when a hero has clearly and fully done the CURRENT OBJECTIVE this turn (not just talked about it). Add "text": one sentence on how they did it. Never advance on intent alone.
+- "log_event": one short past-tense sentence naming the hero, for anything important (promises, insults, thefts, fights, debts, gifts, discoveries). Almost every turn has one.
 
-EXAMPLE: player says "I go to the tavern and buy an ale" ->
+EXAMPLE: ${hero.name} says "I go to the tavern and buy an ale" ->
 {"narration": "...", "actions": [{"type":"move","location":"The Gilded Tankard"},{"type":"change_gold","amount":-1},{"type":"add_item","item":"ale","qty":1}]}
 
 Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
   }
 
   /**
-   * @param context text of this turn (player words + narration). Items can only
+   * @param context text of this turn (hero words + narration). Items can only
    *   be removed if they are mentioned in it, so the DM can't quietly take
-   *   things the player never offered.
+   *   things the hero never offered.
+   * @param heroId the acting hero (null for world ticks).
    * @param allowed restrict which action types are accepted (used by world ticks).
    */
-  applyActions(actions: Action[], context: string, allowed?: Action["type"][]) {
+  applyActions(actions: Action[], context: string, heroId: string | null, allowed?: Action["type"][]) {
     const changes: string[] = [];
+    const hero = heroId ? this.getHero(heroId) : null;
     for (const a of actions.slice(0, 10)) {
       if (allowed && !allowed.includes(a.type)) continue;
+      if (!hero && a.type !== "npc_update" && a.type !== "log_event") continue;
       try {
         switch (a.type) {
           case "move": {
             const loc = Object.keys(LOCATIONS).find((l) => l.toLowerCase() === String(a.location).toLowerCase());
-            if (loc) {
-              this.sql`UPDATE player SET location = ${loc} WHERE id = 1`;
+            if (loc && loc !== this.getHero(heroId!)!.location) {
+              this.sql`UPDATE heroes SET location = ${loc} WHERE id = ${heroId}`;
               changes.push(`📍 Moved to ${loc}`);
             }
             break;
@@ -315,44 +398,58 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
             const item = cleanName(a.item);
             const qty = clampInt(a.qty ?? 1, 1, 99);
             if (!item) break;
-            this.sql`INSERT INTO inventory (item, qty) VALUES (${item}, ${qty})
-                     ON CONFLICT(item) DO UPDATE SET qty = qty + ${qty}`;
+            this.addItem(heroId!, item, qty);
             changes.push(`🎒 +${qty} ${item}`);
             break;
           }
-          case "remove_item": {
+          case "remove_item":
+          case "give_item": {
             const item = cleanName(a.item);
             const qty = clampInt(a.qty ?? 1, 1, 99);
-            const [row] = this.sql<{ qty: number }>`SELECT qty FROM inventory WHERE item = ${item}`;
+            const [row] = this.sql<{ qty: number }>`SELECT qty FROM items WHERE hero_id = ${heroId} AND item = ${item}`;
             if (!row) break;
             if (!mentions(context, item)) {
               console.warn(`Blocked removal of unmentioned item: ${item}`);
               break;
             }
-            if (row.qty <= qty) this.sql`DELETE FROM inventory WHERE item = ${item}`;
-            else this.sql`UPDATE inventory SET qty = qty - ${qty} WHERE item = ${item}`;
-            changes.push(`🎒 −${Math.min(qty, row.qty)} ${item}`);
+            let target: HeroRow | undefined;
+            if (a.type === "give_item") {
+              [target] = this.sql<HeroRow>`SELECT * FROM heroes WHERE lower(name) = lower(${cleanName(a.to, false)})`;
+              if (!target || target.id === heroId) break;
+            } else if (/\b(give|gives|gave|hand|hands|handed|pass|passes|lend|toss|offer)\b/i.test(context)) {
+              // The model often says "remove" for a gift; if another hero is named, move it to them instead.
+              target = this.sql<HeroRow>`SELECT * FROM heroes WHERE id != ${heroId}`
+                .find((h) => new RegExp(`\\b${escapeRe(h.name)}\\b`, "i").test(context));
+            }
+            const moved = Math.min(qty, row.qty);
+            if (row.qty <= qty) this.sql`DELETE FROM items WHERE hero_id = ${heroId} AND item = ${item}`;
+            else this.sql`UPDATE items SET qty = qty - ${qty} WHERE hero_id = ${heroId} AND item = ${item}`;
+            if (target) {
+              this.addItem(target.id, item, moved);
+              this.logEvent(`${hero!.name} gave ${target.name} ${moved} ${item}.`);
+              changes.push(`🤝 Gave ${target.name} ${moved} ${item}`);
+            } else changes.push(`🎒 −${moved} ${item}`);
             break;
           }
           case "change_gold": {
             const amt = clampInt(a.amount, -1000, 1000);
             if (!amt) break;
-            this.sql`UPDATE player SET gold = MAX(0, gold + ${amt}) WHERE id = 1`;
+            this.sql`UPDATE heroes SET gold = MAX(0, gold + ${amt}) WHERE id = ${heroId}`;
             changes.push(`🪙 ${amt > 0 ? "+" : ""}${amt} gold`);
             break;
           }
           case "change_hp": {
             const amt = clampInt(a.amount, -20, 20);
             if (!amt) break;
-            this.sql`UPDATE player SET hp = MIN(max_hp, MAX(0, hp + ${amt})) WHERE id = 1`;
+            this.sql`UPDATE heroes SET hp = MIN(max_hp, MAX(0, hp + ${amt})) WHERE id = ${heroId}`;
             changes.push(`❤️ ${amt > 0 ? "+" : ""}${amt} HP`);
+            if (this.getHero(heroId!)!.hp <= 0) this.logEvent(`${hero!.name} fell in battle.`);
             break;
           }
           case "npc_update": {
             const name = cleanName(a.npc, false);
             if (!name) break;
-            const [existing] = this.sql<{ name: string; location: string; attitude: string; memory: string }>`
-              SELECT * FROM npcs WHERE lower(name) = lower(${name})`;
+            const [existing] = this.sql<NpcRow>`SELECT * FROM npcs WHERE lower(name) = lower(${name})`;
             const attitude = (ATTITUDES as readonly string[]).includes(String(a.attitude))
               ? String(a.attitude)
               : existing?.attitude ?? "neutral";
@@ -363,16 +460,15 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
               ? (fact && !existing.memory.includes(fact) ? `${existing.memory} ${fact}` : existing.memory).slice(-800)
               : fact;
             const location = Object.keys(LOCATIONS).find((l) => l.toLowerCase() === String(a.location ?? "").toLowerCase())
-              ?? existing?.location ?? this.getPlayer()!.location;
+              ?? existing?.location ?? hero?.location ?? "Emberfall Square";
             if (existing) {
               this.sql`UPDATE npcs SET attitude = ${attitude}, memory = ${memory}, location = ${location}
                        WHERE name = ${existing.name}`;
               if (existing.attitude !== attitude) {
                 changes.push(`🧑 ${existing.name}: ${existing.attitude} → ${attitude}`);
                 // Don't rely on the model to log relationship changes — they're what the legend is made of.
-                this.logEvent(`${existing.name} became ${attitude} toward ${this.getPlayer()!.name}.${fact ? " " + fact : ""}`);
-              }
-              else changes.push(`🧠 ${existing.name} will remember that`);
+                this.logEvent(`${existing.name} became ${attitude}${hero ? ` toward ${hero.name}` : ""}.${fact ? " " + fact : ""}`);
+              } else changes.push(`🧠 ${existing.name} will remember that`);
             } else {
               this.sql`INSERT INTO npcs (name, location, attitude, memory)
                        VALUES (${name}, ${location}, ${attitude}, ${memory})`;
@@ -385,7 +481,7 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
             if (stage >= MAIN_QUEST.stages.length) break;
             const done = MAIN_QUEST.stages[stage].objective;
             this.setQuestStage(stage + 1);
-            this.logEvent(`QUEST: ${a.text ? String(a.text).slice(0, 160) : `Completed: ${done}`}`);
+            this.logEvent(`QUEST: ${a.text ? String(a.text).slice(0, 160) : `${hero!.name} completed: ${done}`}`);
             changes.push(stage + 1 >= MAIN_QUEST.stages.length ? "🏆 The bell rings again! Quest complete" : `🎯 Objective complete: ${done}`);
             break;
           }
@@ -404,11 +500,17 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
     return changes;
   }
 
+  addItem(heroId: string, item: string, qty: number) {
+    this.sql`INSERT INTO items (hero_id, item, qty) VALUES (${heroId}, ${item}, ${qty})
+             ON CONFLICT(hero_id, item) DO UPDATE SET qty = qty + ${qty}`;
+  }
+
   resetWorld() {
-    for (const t of ["player", "inventory", "npcs", "events", "messages", "chapters", "meta"]) {
+    for (const t of ["heroes", "items", "npcs", "events", "log", "chapters", "meta"]) {
       this.ctx.storage.sql.exec(`DELETE FROM ${t}`);
     }
-    this.setState(this.initialState);
+    this.broadcast(JSON.stringify({ type: "mf_reset" }));
+    this.setState({ ...this.initialState });
   }
 
   // ---------- Chronicle (called by ChronicleWorkflow over RPC) ----------
@@ -430,11 +532,11 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
   }
 
   getPendingEvents() {
-    const player = this.getPlayer();
+    const names = this.allHeroes().map((h) => h.name);
     const events = this.sql<{ id: number; text: string }>`
       SELECT id, text FROM events WHERE id > ${this.lastChronicledId()} ORDER BY id ASC LIMIT 40`;
     const [count] = this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM chapters`;
-    return { hero: player?.name ?? "the hero", chapterNo: count.n + 1, events };
+    return { hero: names.join(" and ") || "the heroes", chapterNo: count.n + 1, events };
   }
 
   saveChapter(title: string, summary: string, lastEventId: number) {
@@ -442,12 +544,13 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
     this.sql`INSERT INTO chapters (title, summary, last_event_id)
              VALUES (${title.slice(0, 80)}, ${summary.slice(0, 600)}, ${lastEventId})`;
     this.sql`DELETE FROM meta WHERE key = 'chronicle_started'`;
+    this.pushLog({ role: "system", hero: null, content: `📖 ${title} — ${summary}` });
     this.snapshot(); // push new state to any connected clients
     return true;
   }
 
   // ---------- World ticks (Agent scheduler) ----------
-  /** (Re)arm a single tick that fires if the player stays away. */
+  /** (Re)arm a single tick that fires once the whole world has been quiet for a while. */
   async scheduleWorldTick() {
     for (const sch of this.getSchedules()) {
       if (sch.callback === "worldTick") await this.cancelSchedule(sch.id);
@@ -455,29 +558,32 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
     await this.schedule(Number(this.env.TICK_SECONDS ?? 600), "worldTick");
   }
 
-  /** The world moves without the player: grudges spread, favors are remembered. */
+  /** The world moves without the heroes: grudges spread, favors are remembered. */
   async worldTick() {
-    const player = this.getPlayer();
-    if (!player || player.hp <= 0) return;
+    const heroes = this.allHeroes().filter((h) => h.hp > 0);
+    if (heroes.length === 0) return;
+    if (heroes.some((h) => h.online)) return; // someone is still playing; the clock restarts when they leave
     const [existing] = this.sql<{ value: string }>`SELECT value FROM meta WHERE key = 'away_news'`;
     if (existing) return; // one tick per absence keeps the world (and the AI budget) calm
 
-    const npcs = this.sql<{ name: string; location: string; attitude: string; memory: string }>`SELECT * FROM npcs`;
+    const names = heroes.map((h) => h.name).join(", ");
+    const first = heroes[0].name;
+    const npcs = this.sql<NpcRow>`SELECT * FROM npcs`;
     const events = this.sql<{ text: string }>`SELECT text FROM events ORDER BY id DESC LIMIT 10`.reverse();
     const result = (await this.env.AI.run(this.env.MODEL as keyof AiModels, {
       messages: [
         {
           role: "system",
-          content: `You simulate the village of Emberfall while the hero ${player.name} is away (a night passes).
-Based ONLY on the facts below, decide 1-2 believable consequences of the hero's past actions: hostile NPCs spread rumors and turn others wary; grateful NPCs defend the hero; debts and promises come up; the mystery of the silent bell deepens.
-If the hero has done nothing notable, describe one small eerie happening linked to the main quest instead.
+          content: `You simulate the village of Emberfall while its heroes (${names}) are away (a night passes).
+Based ONLY on the facts below, decide 1-2 believable consequences of the heroes' past actions: hostile NPCs spread rumors and turn others wary; grateful NPCs defend a hero; debts and promises come up; the mystery of the silent bell deepens.
+If the heroes have done nothing notable, describe one small eerie happening linked to the main quest instead.
 Main quest: ${MAIN_QUEST.premise} ${this.questPromptSection()}
 NPCS:
 ${npcs.map((n) => `- ${n.name} @ ${n.location} [${n.attitude}]: ${n.memory}`).join("\n")}
 RECENT EVENTS:
 ${events.map((e) => `- ${e.text}`).join("\n") || "- none"}
 
-Be SPECIFIC: name who did what, where, and why (e.g. "Bram told the tavern crowd that ${player.name} is a liar; Mira now eyes the hero warily.").
+Be SPECIFIC: name who did what, where, and why.
 Every attitude change in your narration MUST also appear as an npc_update action.
 Reply ONLY with JSON: {"narration": "<what happened, 1-2 sentences, under 40 words, past tense>", "actions": [...]}
 Allowed actions: "npc_update" (npc, attitude ${ATTITUDES.join("/")}, memory = ONE new fact) and "log_event" (text). Change at most 2 attitudes, by one step at most.`,
@@ -485,7 +591,7 @@ Allowed actions: "npc_update" (npc, attitude ${ATTITUDES.join("/")}, memory = ON
         {
           role: "user",
           content: `What happened in Emberfall overnight? Example of a GOOD answer (do not copy it):
-{"narration": "Over ale, Bram told everyone ${player.name} cheated him. Old Tessa spat at the mention of the hero's name.", "actions": [{"type":"npc_update","npc":"Old Tessa","attitude":"hostile","memory":"Heard from Bram that ${player.name} is a cheat."}]}
+{"narration": "Over ale, Bram told everyone ${first} cheated him. Old Tessa spat at the mention of ${first}'s name.", "actions": [{"type":"npc_update","npc":"Old Tessa","attitude":"hostile","memory":"Heard from Bram that ${first} is a cheat."}]}
 A BAD answer is vague, like "Rumors spread, villagers became wary."`,
         },
       ],
@@ -495,9 +601,10 @@ A BAD answer is vague, like "Rumors spread, villagers became wary."`,
     } as any)) as { response?: unknown };
 
     const parsed = parseModelOutput(result?.response);
-    this.applyActions(parsed.actions, "", ["npc_update", "log_event"]);
-    this.logEvent(`While ${player.name} was away: ${parsed.narration.slice(0, 180)}`);
+    this.applyActions(parsed.actions, "", null, ["npc_update", "log_event"]);
+    this.logEvent(`While the heroes were away: ${parsed.narration.slice(0, 180)}`);
     this.sql`INSERT OR REPLACE INTO meta (key, value) VALUES ('away_news', ${parsed.narration})`;
+    this.pushLog({ role: "system", hero: null, content: `🌙 While you were away… ${parsed.narration}` });
     this.snapshot();
   }
 
@@ -514,38 +621,57 @@ A BAD answer is vague, like "Rumors spread, villagers became wary."`,
   questPromptSection() {
     const stage = this.questStage();
     if (stage >= MAIN_QUEST.stages.length) {
-      return "QUEST COMPLETE: the bell rings again. The hero is a legend; let them roam freely and enjoy the consequences.";
+      return "QUEST COMPLETE: the bell rings again. The heroes are legends; let them roam freely and enjoy the consequences.";
     }
     const s = MAIN_QUEST.stages[stage];
     return `CURRENT OBJECTIVE (stage ${stage + 1}/${MAIN_QUEST.stages.length}): ${s.objective}
 SECRET DM HINT: ${s.hint}
 DONE WHEN: ${s.doneWhen} -> the moment this happens in your narration, include {"type":"advance_quest"}.
-The player is free to wander, but if they seem lost or ask what to do, let an NPC or detail nudge them toward the current objective. Never solve it for them.`;
+Heroes are free to wander, but if one seems lost or asks what to do, let an NPC or detail nudge them toward the current objective. Never solve it for them.`;
   }
 
   // ---------- Helpers ----------
-  getPlayer() {
-    const [p] = this.sql<{ name: string; hp: number; max_hp: number; gold: number; location: string; turn: number }>`
-      SELECT * FROM player WHERE id = 1`;
-    return p ?? null;
+  getHero(id: string) {
+    const [h] = this.sql<HeroRow>`SELECT * FROM heroes WHERE id = ${id}`;
+    return h ?? null;
+  }
+
+  allHeroes(): Hero[] {
+    const online = this.onlineHeroIds();
+    const items = this.sql<{ hero_id: string; item: string; qty: number }>`SELECT * FROM items ORDER BY item`;
+    return this.sql<HeroRow>`SELECT * FROM heroes ORDER BY rowid`.map((h) => ({
+      id: h.id,
+      name: h.name,
+      hp: h.hp,
+      maxHp: h.max_hp,
+      gold: h.gold,
+      location: h.location,
+      inventory: items.filter((i) => i.hero_id === h.id).map(({ item, qty }) => ({ item, qty })),
+      online: online.has(h.id),
+    }));
+  }
+
+  /** Store a story line and stream it to every connected hero. */
+  pushLog(entry: LogEntry) {
+    this.sql`INSERT INTO log (role, hero, content) VALUES (${entry.role}, ${entry.hero}, ${entry.content})`;
+    this.sql`DELETE FROM log WHERE id NOT IN (SELECT id FROM log ORDER BY id DESC LIMIT 60)`;
+    this.broadcast(JSON.stringify({ type: "mf_log", entry }));
   }
 
   logEvent(text: string) {
     const [dup] = this.sql<{ n: number }>`
       SELECT COUNT(*) AS n FROM (SELECT text FROM events ORDER BY id DESC LIMIT 5) WHERE lower(text) = lower(${text})`;
     if (dup.n > 0) return; // skip repeats of a recent event
-    const turn = this.getPlayer()?.turn ?? 0;
-    this.sql`INSERT INTO events (turn, text) VALUES (${turn}, ${text})`;
+    const [count] = this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM log WHERE role = 'user'`;
+    this.sql`INSERT INTO events (turn, text) VALUES (${count.n}, ${text})`;
   }
 
   snapshot() {
-    const p = this.getPlayer();
+    const heroes = this.allHeroes();
     const state: WorldState = {
-      started: !!p,
-      turn: p?.turn ?? 0,
-      player: p ? { name: p.name, hp: p.hp, maxHp: p.max_hp, gold: p.gold, location: p.location } : null,
-      inventory: this.sql<{ item: string; qty: number }>`SELECT item, qty FROM inventory ORDER BY item`,
-      npcs: this.sql<{ name: string; location: string; attitude: Attitude; memory: string }>`SELECT * FROM npcs ORDER BY name`,
+      started: heroes.length > 0,
+      heroes,
+      npcs: this.sql<NpcRow>`SELECT * FROM npcs ORDER BY name` as WorldState["npcs"],
       recentEvents: this.sql<{ text: string }>`
         SELECT text FROM events WHERE id > ${this.lastChronicledId()} ORDER BY id DESC LIMIT 10`.map((e) => e.text),
       chapters: this.sql<{ title: string; summary: string }>`SELECT title, summary FROM chapters ORDER BY id ASC`,
@@ -562,8 +688,8 @@ The player is free to wander, but if they seem lost or ask what to do, let an NP
         };
       })(),
     };
-    this.setState(state); // keeps Agent state in sync (used by WebSocket clients later)
-    const log = this.sql<{ role: string; content: string }>`SELECT role, content FROM messages ORDER BY id ASC`;
+    this.setState(state); // Agent state sync -> every connected WebSocket client re-renders
+    const log = this.sql<{ role: string; hero: string | null; content: string }>`SELECT role, hero, content FROM log ORDER BY id ASC`;
     return { state, log };
   }
 }
@@ -645,6 +771,14 @@ function parseModelOutput(raw: unknown): { narration: string; actions: Action[] 
 function mentions(text: string, item: string) {
   const hay = text.toLowerCase();
   return item.split(/\s+/).some((w) => w.length >= 3 && hay.includes(w.replace(/s$/, "")));
+}
+
+function escapeRe(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function validId(v: unknown): v is string {
+  return typeof v === "string" && /^[A-Za-z0-9-]{8,64}$/.test(v);
 }
 
 function cleanName(v: unknown, lower = true) {
