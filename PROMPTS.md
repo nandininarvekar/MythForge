@@ -18,3 +18,4 @@ AI-assisted development log (Claude Code). Prompts listed in order.
 14. "i think the messages are a little too lengthy,"
 15. "this looks good, whats your next step"
 16. "https://github.com/nandininarvekar/MythForge — this is the repo"
+17. "i have pushed. i noticed while playing, the player doesnt know his aim initially, so that the game can go ahead in certain way, is that fixed"

@@ -33,9 +33,47 @@ const LOCATIONS: Record<string, string> = {
   "Whisperwood Edge": "Where the village ends and an old, watchful forest begins.",
 };
 
+/**
+ * The main quest gives every story a spine. The server tracks the stage, so the
+ * LLM can't skip ahead or forget; it only signals "advance_quest" when the
+ * player has clearly done the current objective. How they do it is up to them.
+ */
+const MAIN_QUEST = {
+  title: "The Silent Bell",
+  premise:
+    "Emberfall's great bell stopped ringing three nights ago. Since then, one villager vanishes into Whisperwood every night, and the last to go was Tomas, Mira's younger brother. Nobody knows why. The hero has come to find out.",
+  stages: [
+    {
+      objective: "Find out what happened the night Tomas vanished.",
+      hint: "Mira at The Gilded Tankard saw Tomas leave. When asked, she reveals he followed a voice singing in the bell's tone toward Whisperwood, and that the bell went silent the same hour.",
+      doneWhen: "Mira (or another witness) has told the player about the singing voice that lured Tomas away.",
+    },
+    {
+      objective: "Get a weapon that can cut what lives in Whisperwood.",
+      hint: "Only Bram can temper steel with ember-iron, and it costs 15 gold or a favor. If Bram is hostile, the hero must make amends first, or find another clever way.",
+      doneWhen: "The player owns an ember-iron weapon (add_item it in the same turn).",
+    },
+    {
+      objective: "Obtain Old Tessa's charm to see through the forest's glamour.",
+      hint: "Old Tessa at the Night Market never sells for gold alone. She wants a true secret, a memory, or a small brave deed.",
+      doneWhen: "The player owns the glamour charm (add_item it in the same turn).",
+    },
+    {
+      objective: "Enter Whisperwood and find the missing villagers.",
+      hint: "From Whisperwood Edge the singing leads to a hollow oak where the villagers sleep in a trance, Tomas among them.",
+      doneWhen: "The player has found the entranced villagers at the hollow oak.",
+    },
+    {
+      objective: "Face the Hollow Warden and make the bell ring again.",
+      hint: "The Warden, a creature of bark and echoes, stole the bell's voice to lure people in. It can be fought, tricked, or bargained with.",
+      doneWhen: "The Warden is defeated, tricked or persuaded, and the bell's voice is freed.",
+    },
+  ],
+};
+
 const STARTING_NPCS = [
-  { name: "Bram", location: "Bram's Forge", attitude: "neutral", memory: "Gruff blacksmith, proud of his work." },
-  { name: "Mira", location: "The Gilded Tankard", attitude: "friendly", memory: "Innkeeper who hears every rumor." },
+  { name: "Bram", location: "Bram's Forge", attitude: "neutral", memory: "Gruff blacksmith, proud of his work. The only smith who knows ember-iron." },
+  { name: "Mira", location: "The Gilded Tankard", attitude: "friendly", memory: "Innkeeper who hears every rumor. Her brother Tomas vanished into Whisperwood." },
   { name: "Old Tessa", location: "Night Market", attitude: "wary", memory: "Fortune-teller who sells strange charms." },
 ];
 
@@ -47,6 +85,7 @@ export type WorldState = {
   npcs: { name: string; location: string; attitude: Attitude; memory: string }[];
   recentEvents: string[];
   chapters: { title: string; summary: string }[];
+  quest: { title: string; stage: number; total: number; objective: string; complete: boolean };
 };
 
 type Action =
@@ -56,7 +95,8 @@ type Action =
   | { type: "change_gold"; amount: number }
   | { type: "change_hp"; amount: number }
   | { type: "npc_update"; npc: string; attitude?: string; memory?: string; location?: string }
-  | { type: "log_event"; text: string };
+  | { type: "log_event"; text: string }
+  | { type: "advance_quest"; text?: string };
 
 const RESPONSE_SCHEMA = {
   type: "object",
@@ -69,7 +109,7 @@ const RESPONSE_SCHEMA = {
         properties: {
           type: {
             type: "string",
-            enum: ["move", "add_item", "remove_item", "change_gold", "change_hp", "npc_update", "log_event"],
+            enum: ["move", "add_item", "remove_item", "change_gold", "change_hp", "npc_update", "log_event", "advance_quest"],
           },
           location: { type: "string" },
           item: { type: "string" },
@@ -96,6 +136,7 @@ export class MythAgent extends Agent<Env, WorldState> {
     npcs: [],
     recentEvents: [],
     chapters: [],
+    quest: { title: MAIN_QUEST.title, stage: 0, total: MAIN_QUEST.stages.length, objective: "", complete: false },
   };
 
   async onStart() {
@@ -150,7 +191,10 @@ export class MythAgent extends Agent<Env, WorldState> {
                VALUES (${n.name}, ${n.location}, ${n.attitude}, ${n.memory})`;
     }
     this.logEvent(`${name} arrived in Emberfall.`);
-    return this.playTurn("(I arrive in the village for the first time. Set the scene.)", true);
+    return this.playTurn(
+      "(I arrive in Emberfall for the first time. Set the scene in 3-4 sentences: the silent bell, the vanishings, and Mira's missing brother Tomas, so I know my goal. End by pointing me toward my first lead.)",
+      true,
+    );
   }
 
   async playTurn(message: string, isIntro = false) {
@@ -216,6 +260,9 @@ ${chapters.map((c) => `- ${c.title}: ${c.summary}`).join("\n") || "- (this story
 RECENT EVENTS (oldest first):
 ${events.map((e) => `- ${e.text}`).join("\n") || "- none"}
 
+MAIN QUEST — "${MAIN_QUEST.title}": ${MAIN_QUEST.premise}
+${this.questPromptSection()}
+
 FATE DIE this turn: d20 = ${roll}. Only if the player attempts something risky, use it: 1-5 fails badly, 6-10 fails, 11-15 succeeds with a cost, 16-20 succeeds well. Mention the roll when you use it.
 
 RULES FOR CHANGING THE WORLD: if anything in the story changes the world, you MUST record it as an action, or it did not happen.
@@ -223,6 +270,7 @@ RULES FOR CHANGING THE WORLD: if anything in the story changes the world, you MU
 - "add_item"/"remove_item": item (lowercase) + qty. Player can only use or give items they own.
 - "change_gold"/"change_hp": amount (+/-). Gold can't go below 0.
 - "npc_update": npc name, and any of attitude (${ATTITUDES.join("/")}), memory (ONE short NEW fact the NPC will remember, e.g. "Kael spat on his anvil."), location. Use this to introduce NEW npcs too.
+- "advance_quest": ONLY when the player has clearly and fully done the CURRENT OBJECTIVE this turn (not just talked about it). Add "text": one sentence on how they did it. Never advance on intent alone.
 - "log_event": one short past-tense sentence for anything important (promises, insults, thefts, fights, debts, discoveries). Almost every turn has one.
 
 EXAMPLE: player says "I go to the tavern and buy an ale" ->
@@ -309,6 +357,15 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
             }
             break;
           }
+          case "advance_quest": {
+            const stage = this.questStage();
+            if (stage >= MAIN_QUEST.stages.length) break;
+            const done = MAIN_QUEST.stages[stage].objective;
+            this.setQuestStage(stage + 1);
+            this.logEvent(`QUEST: ${a.text ? String(a.text).slice(0, 160) : `Completed: ${done}`}`);
+            changes.push(stage + 1 >= MAIN_QUEST.stages.length ? "🏆 The bell rings again! Quest complete" : `🎯 Objective complete: ${done}`);
+            break;
+          }
           case "log_event": {
             if (a.text) {
               this.logEvent(String(a.text).slice(0, 200));
@@ -366,6 +423,28 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
     return true;
   }
 
+  // ---------- Quest ----------
+  questStage(): number {
+    const [row] = this.sql<{ value: string }>`SELECT value FROM meta WHERE key = 'quest_stage'`;
+    return row ? Number(row.value) : 0;
+  }
+
+  setQuestStage(stage: number) {
+    this.sql`INSERT OR REPLACE INTO meta (key, value) VALUES ('quest_stage', ${String(stage)})`;
+  }
+
+  questPromptSection() {
+    const stage = this.questStage();
+    if (stage >= MAIN_QUEST.stages.length) {
+      return "QUEST COMPLETE: the bell rings again. The hero is a legend; let them roam freely and enjoy the consequences.";
+    }
+    const s = MAIN_QUEST.stages[stage];
+    return `CURRENT OBJECTIVE (stage ${stage + 1}/${MAIN_QUEST.stages.length}): ${s.objective}
+SECRET DM HINT: ${s.hint}
+DONE WHEN: ${s.doneWhen} -> the moment this happens in your narration, include {"type":"advance_quest"}.
+The player is free to wander, but if they seem lost or ask what to do, let an NPC or detail nudge them toward the current objective. Never solve it for them.`;
+  }
+
   // ---------- Helpers ----------
   getPlayer() {
     const [p] = this.sql<{ name: string; hp: number; max_hp: number; gold: number; location: string; turn: number }>`
@@ -374,6 +453,9 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
   }
 
   logEvent(text: string) {
+    const [dup] = this.sql<{ n: number }>`
+      SELECT COUNT(*) AS n FROM (SELECT text FROM events ORDER BY id DESC LIMIT 5) WHERE lower(text) = lower(${text})`;
+    if (dup.n > 0) return; // skip repeats of a recent event
     const turn = this.getPlayer()?.turn ?? 0;
     this.sql`INSERT INTO events (turn, text) VALUES (${turn}, ${text})`;
   }
@@ -389,6 +471,17 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
       recentEvents: this.sql<{ text: string }>`
         SELECT text FROM events WHERE id > ${this.lastChronicledId()} ORDER BY id DESC LIMIT 10`.map((e) => e.text),
       chapters: this.sql<{ title: string; summary: string }>`SELECT title, summary FROM chapters ORDER BY id ASC`,
+      quest: (() => {
+        const stage = this.questStage();
+        const complete = stage >= MAIN_QUEST.stages.length;
+        return {
+          title: MAIN_QUEST.title,
+          stage,
+          total: MAIN_QUEST.stages.length,
+          objective: complete ? "The bell rings again. Your legend is forged." : MAIN_QUEST.stages[stage].objective,
+          complete,
+        };
+      })(),
     };
     this.setState(state); // keeps Agent state in sync (used by WebSocket clients later)
     const log = this.sql<{ role: string; content: string }>`SELECT role, content FROM messages ORDER BY id ASC`;

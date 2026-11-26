@@ -36,6 +36,8 @@
   .friendly { background: #275a2e; } .loyal { background: #1f4f6b; }
   .mem { color: var(--muted); font-size: 14px; }
   .chapter { margin-bottom: 10px; } .chapter b { color: var(--accent); font-size: 15px; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; margin: 6px 0; overflow: hidden; }
+  .bar span { display: block; height: 100%; background: var(--accent); }
   .note { align-self: center; color: var(--muted); font-style: italic; font-size: 15px; }
   #intro { max-width: 460px; margin: 12vh auto; text-align: center; padding: 0 16px; }
   #intro p { color: var(--muted); }
@@ -53,7 +55,8 @@
 </header>
 
 <section id="intro">
-  <p>A village that never forgets. Every promise, insult and debt is remembered — forever.</p>
+  <p>Emberfall's bell has fallen silent, and every night someone vanishes into the woods.</p>
+  <p>A village that never forgets — every promise, insult and debt is remembered, forever.</p>
   <form id="startForm" style="border:0;padding:0">
     <input id="name" placeholder="Your hero's name" maxlength="30" autocomplete="off" />
     <button>Begin</button>
@@ -70,6 +73,7 @@
     </form>
   </main>
   <aside>
+    <h2>Quest</h2><div id="quest"></div>
     <h2>Hero</h2><ul id="hero"></ul>
     <h2>Inventory</h2><ul id="inv"></ul>
     <h2>People of Emberfall</h2><ul id="npcs"></ul>
@@ -116,6 +120,13 @@
     $("game").hidden = !state.started;
     $("reset").hidden = !state.started;
     if (!state.started) return;
+    const q = state.quest;
+    if (q) {
+      const pct = Math.round((q.stage / q.total) * 100);
+      $("quest").innerHTML = `<b>${esc(q.title)}</b>
+        <div class="bar"><span style="width:${pct}%"></span></div>
+        <div class="mem">${q.complete ? "" : `Step ${q.stage + 1} of ${q.total}: `}${esc(q.objective)}</div>`;
+    }
     const p = state.player;
     $("hero").innerHTML = `<li><b>${esc(p.name)}</b></li><li>❤️ ${p.hp}/${p.maxHp} HP</li><li>🪙 ${p.gold} gold</li><li>📍 ${esc(p.location)}</li>`;
     $("inv").innerHTML = state.inventory.map((i) => `<li>${esc(i.item)} ×${i.qty}</li>`).join("") || "<li class=mem>empty</li>";
