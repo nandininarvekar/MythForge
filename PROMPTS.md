@@ -21,3 +21,4 @@ AI-assisted development log (Claude Code). Prompts listed in order.
 17. "i have pushed. i noticed while playing, the player doesnt know his aim initially, so that the game can go ahead in certain way, is that fixed"
 18. "Tell me if you want rules that stop trades taking items you didn't name. - yes. go ahead with next changes"
 19. "yes go ahead with step 3"
+20. "make readme"
