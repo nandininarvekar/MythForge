@@ -172,6 +172,7 @@
     $("log").innerHTML = "";
     log.forEach((m) => addMsg(m.role, m.content));
     render(state);
+    if (state.awayNews) note(`🌙 While you were away… ${state.awayNews}`);
   }
 
   $("startForm").onsubmit = async (e) => {

@@ -14,6 +14,8 @@ export interface Env {
   AI: Ai;
   MythAgent: DurableObjectNamespace<MythAgent>;
   MODEL: string;
+  /** Seconds of player absence before the world "ticks" on its own. */
+  TICK_SECONDS?: string;
   CHRONICLE: Workflow<ChronicleParams>;
 }
 
@@ -84,6 +86,7 @@ export type WorldState = {
   inventory: { item: string; qty: number }[];
   npcs: { name: string; location: string; attitude: Attitude; memory: string }[];
   recentEvents: string[];
+  awayNews: string | null;
   chapters: { title: string; summary: string }[];
   quest: { title: string; stage: number; total: number; objective: string; complete: boolean };
 };
@@ -135,6 +138,7 @@ export class MythAgent extends Agent<Env, WorldState> {
     inventory: [],
     npcs: [],
     recentEvents: [],
+    awayNews: null,
     chapters: [],
     quest: { title: MAIN_QUEST.title, stage: 0, total: MAIN_QUEST.stages.length, objective: "", complete: false },
   };
@@ -210,8 +214,14 @@ export class MythAgent extends Agent<Env, WorldState> {
     const history = this.sql<{ role: string; content: string }>`
       SELECT role, content FROM (SELECT * FROM messages ORDER BY id DESC LIMIT 8) ORDER BY id ASC`;
 
+    // News from a world tick that happened while the player was away (shown once).
+    const [away] = this.sql<{ value: string }>`SELECT value FROM meta WHERE key = 'away_news'`;
+    const awayNote = away
+      ? `\n\nWHILE THE PLAYER WAS AWAY: ${away.value}\nThe world has changed accordingly; let it show naturally this turn (a look, a rumor, a cold welcome).`
+      : "";
+
     const messages = [
-      { role: "system", content: this.systemPrompt(roll) },
+      { role: "system", content: this.systemPrompt(roll) + awayNote },
       ...history.map((m) => ({ role: m.role, content: m.content })),
       { role: "user", content: text },
     ];
@@ -224,7 +234,8 @@ export class MythAgent extends Agent<Env, WorldState> {
     } as any)) as { response?: unknown };
 
     const parsed = parseModelOutput(result?.response);
-    const changes = this.applyActions(parsed.actions);
+    const changes = this.applyActions(parsed.actions, `${text} ${parsed.narration}`);
+    if (away) this.sql`DELETE FROM meta WHERE key = 'away_news'`;
 
     this.sql`UPDATE player SET turn = turn + 1 WHERE id = 1`;
     if (!isIntro) this.sql`INSERT INTO messages (role, content) VALUES ('user', ${text})`;
@@ -232,6 +243,7 @@ export class MythAgent extends Agent<Env, WorldState> {
     this.sql`DELETE FROM messages WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT 40)`;
 
     const chronicling = await this.startChronicle(false);
+    await this.scheduleWorldTick();
     const snap = this.snapshot();
     return { narration: parsed.narration, roll, changes, chronicling, ...snap };
   }
@@ -267,7 +279,7 @@ FATE DIE this turn: d20 = ${roll}. Only if the player attempts something risky, 
 
 RULES FOR CHANGING THE WORLD: if anything in the story changes the world, you MUST record it as an action, or it did not happen.
 - "move": whenever the player goes to a different place, put a move action FIRST, with one of the LOCATIONS (exact name).
-- "add_item"/"remove_item": item (lowercase) + qty. Player can only use or give items they own.
+- "add_item"/"remove_item": item (lowercase, EXACT inventory name when removing) + qty. Player can only use or give items they own. In trades, take ONLY what the player explicitly offers; never add extra items or gold to the deal.
 - "change_gold"/"change_hp": amount (+/-). Gold can't go below 0.
 - "npc_update": npc name, and any of attitude (${ATTITUDES.join("/")}), memory (ONE short NEW fact the NPC will remember, e.g. "Kael spat on his anvil."), location. Use this to introduce NEW npcs too.
 - "advance_quest": ONLY when the player has clearly and fully done the CURRENT OBJECTIVE this turn (not just talked about it). Add "text": one sentence on how they did it. Never advance on intent alone.
@@ -279,9 +291,16 @@ EXAMPLE: player says "I go to the tavern and buy an ale" ->
 Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
   }
 
-  applyActions(actions: Action[]) {
+  /**
+   * @param context text of this turn (player words + narration). Items can only
+   *   be removed if they are mentioned in it, so the DM can't quietly take
+   *   things the player never offered.
+   * @param allowed restrict which action types are accepted (used by world ticks).
+   */
+  applyActions(actions: Action[], context: string, allowed?: Action["type"][]) {
     const changes: string[] = [];
     for (const a of actions.slice(0, 10)) {
+      if (allowed && !allowed.includes(a.type)) continue;
       try {
         switch (a.type) {
           case "move": {
@@ -306,6 +325,10 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
             const qty = clampInt(a.qty ?? 1, 1, 99);
             const [row] = this.sql<{ qty: number }>`SELECT qty FROM inventory WHERE item = ${item}`;
             if (!row) break;
+            if (!mentions(context, item)) {
+              console.warn(`Blocked removal of unmentioned item: ${item}`);
+              break;
+            }
             if (row.qty <= qty) this.sql`DELETE FROM inventory WHERE item = ${item}`;
             else this.sql`UPDATE inventory SET qty = qty - ${qty} WHERE item = ${item}`;
             changes.push(`🎒 −${Math.min(qty, row.qty)} ${item}`);
@@ -423,6 +446,61 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
     return true;
   }
 
+  // ---------- World ticks (Agent scheduler) ----------
+  /** (Re)arm a single tick that fires if the player stays away. */
+  async scheduleWorldTick() {
+    for (const sch of this.getSchedules()) {
+      if (sch.callback === "worldTick") await this.cancelSchedule(sch.id);
+    }
+    await this.schedule(Number(this.env.TICK_SECONDS ?? 600), "worldTick");
+  }
+
+  /** The world moves without the player: grudges spread, favors are remembered. */
+  async worldTick() {
+    const player = this.getPlayer();
+    if (!player || player.hp <= 0) return;
+    const [existing] = this.sql<{ value: string }>`SELECT value FROM meta WHERE key = 'away_news'`;
+    if (existing) return; // one tick per absence keeps the world (and the AI budget) calm
+
+    const npcs = this.sql<{ name: string; location: string; attitude: string; memory: string }>`SELECT * FROM npcs`;
+    const events = this.sql<{ text: string }>`SELECT text FROM events ORDER BY id DESC LIMIT 10`.reverse();
+    const result = (await this.env.AI.run(this.env.MODEL as keyof AiModels, {
+      messages: [
+        {
+          role: "system",
+          content: `You simulate the village of Emberfall while the hero ${player.name} is away (a night passes).
+Based ONLY on the facts below, decide 1-2 believable consequences of the hero's past actions: hostile NPCs spread rumors and turn others wary; grateful NPCs defend the hero; debts and promises come up; the mystery of the silent bell deepens.
+If the hero has done nothing notable, describe one small eerie happening linked to the main quest instead.
+Main quest: ${MAIN_QUEST.premise} ${this.questPromptSection()}
+NPCS:
+${npcs.map((n) => `- ${n.name} @ ${n.location} [${n.attitude}]: ${n.memory}`).join("\n")}
+RECENT EVENTS:
+${events.map((e) => `- ${e.text}`).join("\n") || "- none"}
+
+Be SPECIFIC: name who did what, where, and why (e.g. "Bram told the tavern crowd that ${player.name} is a liar; Mira now eyes the hero warily.").
+Every attitude change in your narration MUST also appear as an npc_update action.
+Reply ONLY with JSON: {"narration": "<what happened, 1-2 sentences, under 40 words, past tense>", "actions": [...]}
+Allowed actions: "npc_update" (npc, attitude ${ATTITUDES.join("/")}, memory = ONE new fact) and "log_event" (text). Change at most 2 attitudes, by one step at most.`,
+        },
+        {
+          role: "user",
+          content: `What happened in Emberfall overnight? Example of a GOOD answer (do not copy it):
+{"narration": "Over ale, Bram told everyone ${player.name} cheated him. Old Tessa spat at the mention of the hero's name.", "actions": [{"type":"npc_update","npc":"Old Tessa","attitude":"hostile","memory":"Heard from Bram that ${player.name} is a cheat."}]}
+A BAD answer is vague, like "Rumors spread, villagers became wary."`,
+        },
+      ],
+      max_tokens: 400,
+      temperature: 0.9,
+      response_format: { type: "json_schema", json_schema: RESPONSE_SCHEMA },
+    } as any)) as { response?: unknown };
+
+    const parsed = parseModelOutput(result?.response);
+    this.applyActions(parsed.actions, "", ["npc_update", "log_event"]);
+    this.logEvent(`While ${player.name} was away: ${parsed.narration.slice(0, 180)}`);
+    this.sql`INSERT OR REPLACE INTO meta (key, value) VALUES ('away_news', ${parsed.narration})`;
+    this.snapshot();
+  }
+
   // ---------- Quest ----------
   questStage(): number {
     const [row] = this.sql<{ value: string }>`SELECT value FROM meta WHERE key = 'quest_stage'`;
@@ -471,6 +549,7 @@ The player is free to wander, but if they seem lost or ask what to do, let an NP
       recentEvents: this.sql<{ text: string }>`
         SELECT text FROM events WHERE id > ${this.lastChronicledId()} ORDER BY id DESC LIMIT 10`.map((e) => e.text),
       chapters: this.sql<{ title: string; summary: string }>`SELECT title, summary FROM chapters ORDER BY id ASC`,
+      awayNews: this.sql<{ value: string }>`SELECT value FROM meta WHERE key = 'away_news'`[0]?.value ?? null,
       quest: (() => {
         const stage = this.questStage();
         const complete = stage >= MAIN_QUEST.stages.length;
@@ -560,6 +639,12 @@ function parseModelOutput(raw: unknown): { narration: string; actions: Action[] 
     narration: String(obj?.narration ?? "The mists swirl... (the DM is lost for words)"),
     actions: Array.isArray(obj?.actions) ? obj.actions : [],
   };
+}
+
+/** True if any meaningful word of `item` appears in `text`. */
+function mentions(text: string, item: string) {
+  const hay = text.toLowerCase();
+  return item.split(/\s+/).some((w) => w.length >= 3 && hay.includes(w.replace(/s$/, "")));
 }
 
 function cleanName(v: unknown, lower = true) {
