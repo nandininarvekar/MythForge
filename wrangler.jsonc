@@ -9,6 +9,9 @@
   "durable_objects": {
     "bindings": [{ "name": "MythAgent", "class_name": "MythAgent" }]
   },
+  "workflows": [
+    { "name": "mythforge-chronicle", "binding": "CHRONICLE", "class_name": "ChronicleWorkflow" }
+  ],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MythAgent"] }],
   "vars": { "MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast" },
   "observability": { "enabled": true }

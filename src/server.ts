@@ -1,4 +1,5 @@
-import { Agent, routeAgentRequest } from "agents";
+import { Agent, getAgentByName, routeAgentRequest } from "agents";
+import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 
 /**
  * MythForge — an AI Dungeon Master with a persistent world.
@@ -13,7 +14,13 @@ export interface Env {
   AI: Ai;
   MythAgent: DurableObjectNamespace<MythAgent>;
   MODEL: string;
+  CHRONICLE: Workflow<ChronicleParams>;
 }
+
+type ChronicleParams = { world: string };
+
+/** Unchronicled events before a new chapter is written automatically. */
+const CHAPTER_EVERY = 8;
 
 const ATTITUDES = ["hostile", "wary", "neutral", "friendly", "loyal"] as const;
 type Attitude = (typeof ATTITUDES)[number];
@@ -39,6 +46,7 @@ export type WorldState = {
   inventory: { item: string; qty: number }[];
   npcs: { name: string; location: string; attitude: Attitude; memory: string }[];
   recentEvents: string[];
+  chapters: { title: string; summary: string }[];
 };
 
 type Action =
@@ -87,6 +95,7 @@ export class MythAgent extends Agent<Env, WorldState> {
     inventory: [],
     npcs: [],
     recentEvents: [],
+    chapters: [],
   };
 
   async onStart() {
@@ -98,6 +107,9 @@ export class MythAgent extends Agent<Env, WorldState> {
       name TEXT PRIMARY KEY, location TEXT, attitude TEXT, memory TEXT)`;
     this.sql`CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER, text TEXT)`;
+    this.sql`CREATE TABLE IF NOT EXISTS chapters (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, summary TEXT, last_event_id INTEGER)`;
+    this.sql`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`;
     this.sql`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT)`;
   }
@@ -111,6 +123,10 @@ export class MythAgent extends Agent<Env, WorldState> {
     try {
       if (body.action === "start") return Response.json(await this.startGame(body.name ?? ""));
       if (body.action === "turn") return Response.json(await this.playTurn(body.message ?? ""));
+      if (body.action === "rest") {
+        const started = await this.startChronicle(true);
+        return Response.json({ chronicling: started, ...this.snapshot() });
+      }
       if (body.action === "reset") {
         this.resetWorld();
         return Response.json(this.snapshot());
@@ -171,15 +187,19 @@ export class MythAgent extends Agent<Env, WorldState> {
     this.sql`INSERT INTO messages (role, content) VALUES ('assistant', ${parsed.narration})`;
     this.sql`DELETE FROM messages WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT 40)`;
 
+    const chronicling = await this.startChronicle(false);
     const snap = this.snapshot();
-    return { narration: parsed.narration, roll, changes, ...snap };
+    return { narration: parsed.narration, roll, changes, chronicling, ...snap };
   }
 
   systemPrompt(roll: number) {
     const p = this.getPlayer()!;
     const inv = this.sql<{ item: string; qty: number }>`SELECT item, qty FROM inventory`;
     const npcs = this.sql<{ name: string; location: string; attitude: string; memory: string }>`SELECT * FROM npcs`;
-    const events = this.sql<{ text: string }>`SELECT text FROM events ORDER BY id DESC LIMIT 15`.reverse();
+    const chapters = this.sql<{ title: string; summary: string }>`
+      SELECT title, summary FROM chapters ORDER BY id DESC LIMIT 5`.reverse();
+    const events = this.sql<{ text: string }>`
+      SELECT text FROM events WHERE id > ${this.lastChronicledId()} ORDER BY id DESC LIMIT 15`.reverse();
 
     return `You are the Dungeon Master of MythForge, a dark-fantasy text adventure set in the village of Emberfall.
 Narrate in second person. Be punchy: 2-3 sentences, about 25-50 words. Include one vivid detail and, when it fits, a line of NPC dialogue. Show only what changed or what the player notices; no scenery recaps, no summaries of what just happened. Stay in character. Never decide the player's actions for them.
@@ -191,7 +211,9 @@ INVENTORY: ${inv.map((i) => `${i.item} x${i.qty}`).join(", ") || "empty"}
 LOCATIONS: ${Object.entries(LOCATIONS).map(([k, v]) => `${k} — ${v}`).join(" | ")}
 NPCS:
 ${npcs.map((n) => `- ${n.name} @ ${n.location} [${n.attitude}]: ${n.memory}`).join("\n")}
-PAST EVENTS (oldest first):
+THE LEGEND SO FAR (earlier chapters):
+${chapters.map((c) => `- ${c.title}: ${c.summary}`).join("\n") || "- (this story has just begun)"}
+RECENT EVENTS (oldest first):
 ${events.map((e) => `- ${e.text}`).join("\n") || "- none"}
 
 FATE DIE this turn: d20 = ${roll}. Only if the player attempts something risky, use it: 1-5 fails badly, 6-10 fails, 11-15 succeeds with a cost, 16-20 succeeds well. Mention the roll when you use it.
@@ -201,7 +223,7 @@ RULES FOR CHANGING THE WORLD: if anything in the story changes the world, you MU
 - "add_item"/"remove_item": item (lowercase) + qty. Player can only use or give items they own.
 - "change_gold"/"change_hp": amount (+/-). Gold can't go below 0.
 - "npc_update": npc name, and any of attitude (${ATTITUDES.join("/")}), memory (ONE short NEW fact the NPC will remember, e.g. "Kael spat on his anvil."), location. Use this to introduce NEW npcs too.
-- "log_event": one short past-tense sentence for anything important (promises, insults, debts, discoveries).
+- "log_event": one short past-tense sentence for anything important (promises, insults, thefts, fights, debts, discoveries). Almost every turn has one.
 
 EXAMPLE: player says "I go to the tavern and buy an ale" ->
 {"narration": "...", "actions": [{"type":"move","location":"The Gilded Tankard"},{"type":"change_gold","amount":-1},{"type":"add_item","item":"ale","qty":1}]}
@@ -274,7 +296,11 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
             if (existing) {
               this.sql`UPDATE npcs SET attitude = ${attitude}, memory = ${memory}, location = ${location}
                        WHERE name = ${existing.name}`;
-              if (existing.attitude !== attitude) changes.push(`🧑 ${existing.name}: ${existing.attitude} → ${attitude}`);
+              if (existing.attitude !== attitude) {
+                changes.push(`🧑 ${existing.name}: ${existing.attitude} → ${attitude}`);
+                // Don't rely on the model to log relationship changes — they're what the legend is made of.
+                this.logEvent(`${existing.name} became ${attitude} toward ${this.getPlayer()!.name}.${fact ? " " + fact : ""}`);
+              }
               else changes.push(`🧠 ${existing.name} will remember that`);
             } else {
               this.sql`INSERT INTO npcs (name, location, attitude, memory)
@@ -299,10 +325,45 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
   }
 
   resetWorld() {
-    for (const t of ["player", "inventory", "npcs", "events", "messages"]) {
+    for (const t of ["player", "inventory", "npcs", "events", "messages", "chapters", "meta"]) {
       this.ctx.storage.sql.exec(`DELETE FROM ${t}`);
     }
     this.setState(this.initialState);
+  }
+
+  // ---------- Chronicle (called by ChronicleWorkflow over RPC) ----------
+  lastChronicledId(): number {
+    const [row] = this.sql<{ id: number }>`SELECT MAX(last_event_id) AS id FROM chapters`;
+    return row?.id ?? 0;
+  }
+
+  /** Kick off the Chronicle Workflow if enough new events piled up (or forced by resting). */
+  async startChronicle(force: boolean): Promise<boolean> {
+    const [pending] = this.sql<{ n: number }>`
+      SELECT COUNT(*) AS n FROM events WHERE id > ${this.lastChronicledId()}`;
+    if (pending.n < (force ? 2 : CHAPTER_EVERY)) return false;
+    const [lock] = this.sql<{ value: string }>`SELECT value FROM meta WHERE key = 'chronicle_started'`;
+    if (lock && Date.now() - Number(lock.value) < 2 * 60_000) return false; // one at a time
+    this.sql`INSERT OR REPLACE INTO meta (key, value) VALUES ('chronicle_started', ${String(Date.now())})`;
+    await this.env.CHRONICLE.create({ params: { world: this.name } });
+    return true;
+  }
+
+  getPendingEvents() {
+    const player = this.getPlayer();
+    const events = this.sql<{ id: number; text: string }>`
+      SELECT id, text FROM events WHERE id > ${this.lastChronicledId()} ORDER BY id ASC LIMIT 40`;
+    const [count] = this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM chapters`;
+    return { hero: player?.name ?? "the hero", chapterNo: count.n + 1, events };
+  }
+
+  saveChapter(title: string, summary: string, lastEventId: number) {
+    if (lastEventId <= this.lastChronicledId()) return false; // already saved (workflow retry)
+    this.sql`INSERT INTO chapters (title, summary, last_event_id)
+             VALUES (${title.slice(0, 80)}, ${summary.slice(0, 600)}, ${lastEventId})`;
+    this.sql`DELETE FROM meta WHERE key = 'chronicle_started'`;
+    this.snapshot(); // push new state to any connected clients
+    return true;
   }
 
   // ---------- Helpers ----------
@@ -325,11 +386,69 @@ Reply ONLY with JSON: {"narration": "...", "actions": [ ... ]}`;
       player: p ? { name: p.name, hp: p.hp, maxHp: p.max_hp, gold: p.gold, location: p.location } : null,
       inventory: this.sql<{ item: string; qty: number }>`SELECT item, qty FROM inventory ORDER BY item`,
       npcs: this.sql<{ name: string; location: string; attitude: Attitude; memory: string }>`SELECT * FROM npcs ORDER BY name`,
-      recentEvents: this.sql<{ text: string }>`SELECT text FROM events ORDER BY id DESC LIMIT 10`.map((e) => e.text),
+      recentEvents: this.sql<{ text: string }>`
+        SELECT text FROM events WHERE id > ${this.lastChronicledId()} ORDER BY id DESC LIMIT 10`.map((e) => e.text),
+      chapters: this.sql<{ title: string; summary: string }>`SELECT title, summary FROM chapters ORDER BY id ASC`,
     };
     this.setState(state); // keeps Agent state in sync (used by WebSocket clients later)
     const log = this.sql<{ role: string; content: string }>`SELECT role, content FROM messages ORDER BY id ASC`;
     return { state, log };
+  }
+}
+
+// ---------- Chronicle Workflow ----------
+/**
+ * Durable, retried, multi-step job that condenses recent events into a story
+ * chapter. Older events then leave the DM's context, but their meaning lives
+ * on in the chapter — so the world can remember forever without the prompt growing.
+ */
+export class ChronicleWorkflow extends WorkflowEntrypoint<Env, ChronicleParams> {
+  async run(event: WorkflowEvent<ChronicleParams>, step: WorkflowStep) {
+    const { world } = event.payload;
+
+    const pending = await step.do("load events", async () => {
+      const agent = await getAgentByName(this.env.MythAgent, world);
+      return agent.getPendingEvents();
+    });
+    if (pending.events.length === 0) return { skipped: true };
+
+    const chapter = await step.do(
+      "write chapter",
+      { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" }, timeout: "2 minutes" },
+      async () => {
+        const result = (await this.env.AI.run(this.env.MODEL as keyof AiModels, {
+          messages: [
+            {
+              role: "system",
+              content: `You are the village chronicler of Emberfall. Condense events into a legend chapter about ${pending.hero}.
+Write a short evocative title (max 6 words) and a summary of 2-3 sentences (max 60 words).
+Keep every fact that matters later: names, grudges, debts, promises, stolen or given items.
+Reply ONLY with JSON: {"title": "...", "summary": "..."}`,
+            },
+            { role: "user", content: pending.events.map((e) => `- ${e.text}`).join("\n") },
+          ],
+          max_tokens: 300,
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              type: "object",
+              properties: { title: { type: "string" }, summary: { type: "string" } },
+              required: ["title", "summary"],
+            },
+          },
+        } as any)) as { response?: unknown };
+        const raw = result?.response;
+        const obj: any = typeof raw === "string" ? JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0] ?? raw) : raw;
+        if (!obj?.summary) throw new Error("Chronicler returned no summary"); // triggers a retry
+        return { title: `Chapter ${pending.chapterNo}: ${String(obj.title ?? "Untitled")}`, summary: String(obj.summary) };
+      },
+    );
+
+    await step.do("save chapter", async () => {
+      const agent = await getAgentByName(this.env.MythAgent, world);
+      return agent.saveChapter(chapter.title, chapter.summary, pending.events[pending.events.length - 1].id);
+    });
+    return chapter;
   }
 }
 
