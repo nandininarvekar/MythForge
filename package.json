@@ -1,0 +1,22 @@
+{
+  "name": "mythforge",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "tsc"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "MythForge: an AI Dungeon Master with a persistent world, on Cloudflare",
+  "dependencies": {
+    "agents": "^0.34.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261125.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.168.0"
+  },
+  "type": "module"
+}

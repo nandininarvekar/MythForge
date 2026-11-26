@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mythforge",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": "public" },
+  "ai": { "binding": "AI" },
+  "durable_objects": {
+    "bindings": [{ "name": "MythAgent", "class_name": "MythAgent" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MythAgent"] }],
+  "vars": { "MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast" },
+  "observability": { "enabled": true }
+}
