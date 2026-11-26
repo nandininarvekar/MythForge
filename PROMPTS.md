@@ -22,3 +22,6 @@ AI-assisted development log (Claude Code). Prompts listed in order.
 18. "Tell me if you want rules that stop trades taking items you didn't name. - yes. go ahead with next changes"
 19. "yes go ahead with step 3"
 20. "make readme"
+21. "is the multiplayer functionality included"
+22. "check the repository properly, check no keys or email or any confidential material is in it"
+23. "lets deploy"
